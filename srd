@@ -1,0 +1,105 @@
+@GetMapping(value = "/nonvalidatedAddress", produces = MediaType.APPLICATION_JSON_VALUE)
+public ResponseEntity<List<ObjectDeterminationByAddressResponse>> searchNonValidatedAddress(
+        @ApiParam(value = "DB-ID", required = false) @RequestHeader(name = "DB-ID") String deploymentId) {
+
+    List<EpcEnergyCertificate> energyCertificateList =
+            energyCertificateRepository.findByAddressSourceNotValidatedAndNoPropertyId();
+
+    List<EpcEnergyCertificate> updatedCertificates = new ArrayList<>();
+    List<ObjectDeterminationByAddressResponse> responseList = new ArrayList<>();
+
+    // Use one list per status group to avoid multiple DB calls
+    Map<String, List<String>> batchUuidMap = new HashMap<>();
+    Map<String, String> statusMessageMap = new HashMap<>();
+    Map<String, Boolean> epcOdpFlagMap = new HashMap<>();
+
+    MDC.put(Constants.DEPLOYMENT_ID, deploymentId);
+    String transactionID = TransactionidGenerator.generate(UUID.randomUUID().toString().substring(0, 8));
+
+    List<EpcEnergyCertificate> filteredCertificateList =
+            filterAndSkipCertificates(energyCertificateList, transactionID);
+
+    for (EpcEnergyCertificate certificate : filteredCertificateList) {
+        try {
+            EpcAddress epcAddress = certificate.getAddressList().isEmpty()
+                    ? null : certificate.getAddressList().get(0);
+            if (epcAddress == null) continue;
+
+            PostalAddress postalAddress = mapper.toPostalAdressMapper(epcAddress);
+            postalAddress.setValidationState(ValidationStateEnum.NOT_VERIFIED);
+
+            ObjectDeterminationByAddressResponse response =
+                    fetchPropertiesWithRetry(postalAddress, transactionID);
+
+            response.setDeploymentId(deploymentId);
+            response.setTransactionid(transactionID);
+
+            boolean isAddressVerified =
+                    updateCertificateBasedOnAddressAndPropertyDetails(certificate, response);
+
+            updatedCertificates.add(certificate);
+            responseList.add(response);
+
+            // Collect UUIDs grouped by status
+            String uuid = certificate.getEpcUUID();
+            String status;
+            String message;
+            boolean updateEpcAndOdpStatus;
+
+            if (isAddressVerified) {
+                status = OnlineEnquiryStatus.SUCCESS.getStatusName();
+                message = "Empty property details; But verified address added: txnid=" + transactionID;
+                updateEpcAndOdpStatus = true;
+            } else {
+                SearchResult searchResult = response.getSearchResult();
+                List<PropertyDetails> propertyDetails = searchResult.getPropertyDetails();
+                List<PostalAddress> postalAddresses = searchResult.getPostalAddress();
+
+                boolean hasVerifiedAddress = postalAddresses != null &&
+                        postalAddresses.stream().anyMatch(addr ->
+                                ValidationStateEnum.VERIFIED.equals(addr.getValidationState()));
+                boolean hasPropertyDetails =
+                        propertyDetails != null && !propertyDetails.isEmpty();
+
+                if (hasVerifiedAddress && hasPropertyDetails) {
+                    status = OnlineEnquiryStatus.SUCCESS.getStatusName();
+                    message = "Address verified: txnid=" + transactionID;
+                    updateEpcAndOdpStatus = true;
+                } else {
+                    status = OnlineEnquiryStatus.SUCCESS.getStatusName();
+                    message = "Address not validated: ODP state NOT_FOUND/NOT_VERIFIED txnid:" + transactionID;
+                    updateEpcAndOdpStatus = false;
+                }
+            }
+
+            // Map UUIDs per status to batch later
+            batchUuidMap.computeIfAbsent(status, k -> new ArrayList<>()).add(uuid);
+            statusMessageMap.put(status, message);
+            epcOdpFlagMap.put(status, updateEpcAndOdpStatus);
+
+        } catch (Exception ex) {
+            technicalLog.error("Validation failed for uuid={} : {}", certificate.getEpcUUID(), ex.getMessage());
+
+            batchUuidMap.computeIfAbsent(OnlineEnquiryStatus.FAILED.getStatusName(), k -> new ArrayList<>())
+                    .add(certificate.getEpcUUID());
+            statusMessageMap.put(OnlineEnquiryStatus.FAILED.getStatusName(),
+                    "Exception in validation:" + ex.getMessage() + " txnid=" + transactionID);
+            epcOdpFlagMap.put(OnlineEnquiryStatus.FAILED.getStatusName(), false);
+        }
+    }
+
+    // Save certificates first
+    energyCertificateRepository.saveAll(updatedCertificates);
+
+    // Batch update BlackBoard by grouping UUIDs
+    for (Map.Entry<String, List<String>> entry : batchUuidMap.entrySet()) {
+        String status = entry.getKey();
+        List<String> uuids = entry.getValue();
+        String message = statusMessageMap.get(status);
+        boolean updateFlag = epcOdpFlagMap.get(status);
+
+        blackBoardService.updateValidationStatus(uuids, status, message, updateFlag);
+    }
+
+    return ResponseEntity.ok(responseList);
+}

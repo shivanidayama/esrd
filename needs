@@ -1,0 +1,10 @@
+currently your code updates the BlackBoard table methods (updateBlackboard() and updateValidationStatus()) too early in the process — before certificates are saved.
+If an exception occurs after updating the Blackboard but before saving the certificate, the database will become inconsistent.
+
+You want:
+
+All Blackboard updates to happen at the very end, only after all certificates have been successfully saved.
+
+No creation of new classes or objects — just a change in the controller and existing methods.
+
+The update should be able to collect all Blackboard records related to specific UUIDs, store them temporarily, and update them in one batch after certificate saving.

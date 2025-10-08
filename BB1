@@ -1,0 +1,48 @@
+@Service
+public class BlackBoardServiceImpl implements BlackBoardService {
+
+    private static final Logger technicalLog = LoggerFactory.getLogger(BlackBoardServiceImpl.class);
+
+    private final BlackBoardRepository blackBoardRepository;
+
+    public BlackBoardServiceImpl(BlackBoardRepository blackBoardRepository) {
+        this.blackBoardRepository = blackBoardRepository;
+    }
+
+    /**
+     * Updates validation status and message for blackboard entries.
+     * Optionally updates epcStatus and odpStatus fields when flag is true.
+     *
+     * @param uuids List of blackboard UUIDs to update
+     * @param status Validation status to set
+     * @param message Validation message to set
+     * @param updateEpcAndOdpStatus If true, epcStatus and odpStatus fields are updated to the given status
+     */
+    @Override
+    public void updateValidationStatus(List<String> uuids, String status, String message, boolean updateEpcAndOdpStatus) {
+        technicalLog.info("Updating BlackBoard entries {} with status '{}', message '{}', updateEpcAndOdpStatus={}",
+                uuids, status, message, updateEpcAndOdpStatus);
+
+        List<BlackBoard> blackBoards = blackBoardRepository.findByUuidIn(uuids);
+
+        if (blackBoards == null || blackBoards.isEmpty()) {
+            technicalLog.warn("No BlackBoard entries found for UUIDs: {}", uuids);
+            return;
+        }
+
+        for (BlackBoard blackBoard : blackBoards) {
+            blackBoard.setValidationStatus(status);
+            blackBoard.setValidationMessage(message);
+            blackBoard.setLastUpdatedAt(new Date());
+
+            if (updateEpcAndOdpStatus) {
+                blackBoard.setEpcStatus(status);
+                blackBoard.setOdpStatus(status);
+            }
+        }
+
+        blackBoardRepository.saveAll(blackBoards);
+
+        technicalLog.info("Successfully updated BlackBoard entries for UUIDs: {}", uuids);
+    }
+}

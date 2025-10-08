@@ -1,0 +1,299 @@
+@RestController
+@RequestMapping("/your-api-path")
+public class YourController {
+
+    private final EnergyCertificateRepository energyCertificateRepository;
+    private final BlackBoardService blackBoardService;
+    private final ObjectDeterminationService objectDeterminationService;
+    private final Mapper mapper;
+    private final BlackBoardRepository blackBoardRepository;
+    private final EpcPropertyRepository epcPropertyRepository;
+
+    private static final Logger technicalLog = LoggerFactory.getLogger(YourController.class);
+
+    public YourController(
+            EnergyCertificateRepository energyCertificateRepository,
+            BlackBoardService blackBoardService,
+            ObjectDeterminationService objectDeterminationService,
+            Mapper mapper,
+            BlackBoardRepository blackBoardRepository,
+            EpcPropertyRepository epcPropertyRepository
+    ) {
+        this.energyCertificateRepository = energyCertificateRepository;
+        this.blackBoardService = blackBoardService;
+        this.objectDeterminationService = objectDeterminationService;
+        this.mapper = mapper;
+        this.blackBoardRepository = blackBoardRepository;
+        this.epcPropertyRepository = epcPropertyRepository;
+    }
+
+    @GetMapping(value = "/nonvalidatedAddress", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<List<ObjectDeterminationByAddressResponse>> searchNonValidatedAddress(
+            @ApiParam(value = "DB-ID", required = false) @RequestParam(required = false) Long deploymentId) {
+
+        List<EpcEnergyCertificate> energyCertificates =
+                energyCertificateRepository.findByAddressSourceNotValidatedAndNoPropertyId();
+
+        List<EpcEnergyCertificate> filteredCertificates = new ArrayList<>();
+        List<ObjectDeterminationByAddressResponse> responseList = new ArrayList<>();
+        List<EpcEnergyCertificate> updatedCertificates = new ArrayList<>();
+
+        // Helper class to hold blackboard update info
+        class BlackBoardStatusUpdate {
+            String uuid;
+            String status;
+            String message;
+            boolean updateEpcAndOdpStatus;
+
+            BlackBoardStatusUpdate(String uuid, String status, String message, boolean updateEpcAndOdpStatus) {
+                this.uuid = uuid;
+                this.status = status;
+                this.message = message;
+                this.updateEpcAndOdpStatus = updateEpcAndOdpStatus;
+            }
+        }
+        List<BlackBoardStatusUpdate> blackBoardUpdates = new ArrayList<>();
+
+        String transactionID = TransactionidGenerator.generate(UUID.randomUUID().toString().substring(0, 8));
+        MDC.put(Constants.DEPLOYMENT_ID, String.valueOf(deploymentId));
+        MDC.put(Constants.MDC_TRANSACTION_ID, transactionID);
+
+        // Filter certificates with insufficient address - prepare blackboard update
+        for (EpcEnergyCertificate cert : energyCertificates) {
+            EpcAddress epcAddress = cert.getAddressList().isEmpty() ? null : cert.getAddressList().get(0);
+            if (!isAddressComplete(epcAddress)) {
+                blackBoardUpdates.add(new BlackBoardStatusUpdate(
+                        cert.getEpcUUID(),
+                        OnlineEnquiryStatus.SKIPPED.getStatusName(),
+                        "Address not updated: Address not sufficient: txnid:" + transactionID,
+                        false));
+                continue;
+            }
+            filteredCertificates.add(cert);
+        }
+
+        List<EpcEnergyCertificate> filteredCertificateList = filterCertificatesByValidationStatus(filteredCertificates, "SUCCESS");
+
+        for (EpcEnergyCertificate certificate : filteredCertificateList) {
+            try {
+                EpcAddress epcAddress = certificate.getAddressList().isEmpty() ? null : certificate.getAddressList().get(0);
+                if (epcAddress == null) continue;
+
+                PostalAddress postalAddress = mapper.toPostalAddressMapper(epcAddress);
+                postalAddress.setValidationState(ValidationStateEnum.NOT_VERIFIED);
+
+                ObjectDeterminationByAddressResponse response = fetchPropertiesWithRetry(postalAddress, transactionID);
+                response.setDeploymentid(deploymentId);
+                response.setTransactionid(transactionID);
+
+                boolean isAddressVerifiedAndPropertyEmpty =
+                        updateCertificateBasedOnAddressAndPropertyDetails(certificate, response);
+
+                updatedCertificates.add(certificate);
+                responseList.add(response);
+
+                // Prepare blackboard update info based on conditions
+                if (isAddressVerifiedAndPropertyEmpty) {
+                    blackBoardUpdates.add(new BlackBoardStatusUpdate(
+                            certificate.getEpcUUID(),
+                            OnlineEnquiryStatus.SUCCESS.getStatusName(),
+                            "Empty property details; But verified address added: txnid=" + transactionID,
+                            true));
+                } else {
+                    SearchResult searchResult = response.getSearchResult();
+                    List<PropertyDetails> propertyDetails = searchResult.getPropertyDetails();
+                    List<PostalAddress> postalAddresses = searchResult.getPostalAddress();
+
+                    boolean hasVerifiedAddress = postalAddresses != null &&
+                            postalAddresses.stream().anyMatch(addr -> ValidationStateEnum.VERIFIED.equals(addr.getValidationState()));
+                    boolean hasPropertyDetails = propertyDetails != null && !propertyDetails.isEmpty();
+
+                    if (hasVerifiedAddress && hasPropertyDetails) {
+                        blackBoardUpdates.add(new BlackBoardStatusUpdate(
+                                certificate.getEpcUUID(),
+                                OnlineEnquiryStatus.SUCCESS.getStatusName(),
+                                "Address verified: txnid " + transactionID,
+                                true));
+                    } else {
+                        blackBoardUpdates.add(new BlackBoardStatusUpdate(
+                                certificate.getEpcUUID(),
+                                OnlineEnquiryStatus.SUCCESS.getStatusName(),
+                                "Address not validated: ODP address validation state NOT_FOUND/NOT_VERIFIED txnid: " + transactionID,
+                                false));
+                    }
+                }
+            } catch (Exception ex) {
+                technicalLog.error("Validation failed for uuid={} : {}", certificate.getEpcUUID(), ex.getMessage());
+                blackBoardUpdates.add(new BlackBoardStatusUpdate(
+                        certificate.getEpcUUID(),
+                        OnlineEnquiryStatus.FAILED.getStatusName(),
+                        "Exception in validation: " + ex.getMessage() + " txnid=" + transactionID,
+                        false));
+            }
+        }
+
+        energyCertificateRepository.saveAll(updatedCertificates);
+
+        batchUpdateBlackBoardStatuses(blackBoardUpdates);
+
+        return ResponseEntity.ok(responseList);
+    }
+
+    private void batchUpdateBlackBoardStatuses(List<BlackBoardStatusUpdate> updates) {
+        if (updates.isEmpty()) {
+            return;
+        }
+        for (BlackBoardStatusUpdate update : updates) {
+            blackBoardService.updateValidationStatus(
+                    List.of(update.uuid),
+                    update.status,
+                    update.message,
+                    update.updateEpcAndOdpStatus);
+        }
+    }
+
+    private boolean isAddressComplete(EpcAddress epcAddress) {
+        return epcAddress != null
+                && epcAddress.getStreet() != null
+                && epcAddress.getHouseNumber() != null
+                && epcAddress.getZipCode() != null
+                && epcAddress.getCity() != null
+                && epcAddress.getCountrySOCode() != null;
+    }
+
+    private List<EpcEnergyCertificate> filterCertificatesByValidationStatus(List<EpcEnergyCertificate> energyCertificateList, String status) {
+        List<String> uuids = energyCertificateList.stream()
+                .map(EpcEnergyCertificate::getEpcUUID)
+                .collect(Collectors.toList());
+        List<BlackBoard> blackBoards = blackBoardRepository.findByUuidIn(uuids);
+        Set<String> filteredUuids = blackBoards.stream()
+                .filter(bb -> status.equalsIgnoreCase(bb.getValidationStatus()))
+                .map(BlackBoard::getUuid)
+                .collect(Collectors.toSet());
+        return energyCertificateList.stream()
+                .filter(cert -> filteredUuids.contains(cert.getEpcUUID()))
+                .collect(Collectors.toList());
+    }
+
+    private ObjectDeterminationByAddressResponse fetchPropertiesWithRetry(PostalAddress postalAddress, String transactionID) throws Exception {
+        ObjectDeterminationByAddressRequest request = new ObjectDeterminationByAddressRequest();
+        request.setPostalAddress(postalAddress);
+        request.setTransactionld(transactionID);
+        request.setRequestedVersion("2.0.3");
+        request.setAccessChannel("OCR");
+        MDC.put(Constants.MDC_TRANSACTION_ID, transactionID);
+
+        ObjectDeterminationByAddressResponse response = objectDeterminationService.getThePropertiesByCriteria(request);
+
+        boolean hasNotUnique = response.getSearchResult().getPostalAddress().stream()
+                .anyMatch(addr -> ValidationStateEnum.NOT_UNIQUE.equals(addr.getValidationState()));
+
+        if (hasNotUnique) {
+            List<PostalAddress> adjustedAddresses = response.getSearchResult().getPostalAddress().stream()
+                    .map(addr -> {
+                        if (ValidationStateEnum.NOT_UNIQUE.equals(addr.getValidationState()))
+                            addr.setValidationState(ValidationStateEnum.NOT_FOUND);
+                        return addr;
+                    }).collect(Collectors.toList());
+
+            PostalAddress addressForRetry = adjustedAddresses.isEmpty() ? postalAddress : adjustedAddresses.get(0);
+
+            ObjectDeterminationByAddressRequest retryRequest = new ObjectDeterminationByAddressRequest();
+            retryRequest.setPostalAddress(addressForRetry);
+            retryRequest.setTransactionld(transactionID);
+            retryRequest.setAccessChannel("OCR");
+            MDC.put(Constants.MDC_TRANSACTION_ID, transactionID);
+
+            response = objectDeterminationService.getThePropertiesByCriteria(retryRequest);
+        }
+        return response;
+    }
+
+    private boolean updateCertificateBasedOnAddressAndPropertyDetails(
+            EpcEnergyCertificate certificate,
+            ObjectDeterminationByAddressResponse response) {
+
+        SearchResult searchResult = response.getSearchResult();
+        List<PropertyDetails> propertyDetails = searchResult.getPropertyDetails();
+        List<PostalAddress> postalAddresses = searchResult.getPostalAddress();
+
+        boolean propertyDetailsEmpty = propertyDetails == null || propertyDetails.isEmpty();
+        boolean hasVerifiedAddress = postalAddresses != null &&
+                postalAddresses.stream().anyMatch(addr -> ValidationStateEnum.VERIFIED.equals(addr.getValidationState()));
+
+        if (propertyDetailsEmpty && hasVerifiedAddress) {
+            for (PostalAddress verifiedAddr : postalAddresses) {
+                if (ValidationStateEnum.VERIFIED.equals(verifiedAddr.getValidationState())) {
+                    EpcAddress validatedAddress = mapper.toEpcAddressMapper(verifiedAddr);
+                    validatedAddress.setAddressSource(String.valueOf(AddressSourceEnum.PD_VALIDATED));
+                    validatedAddress.setEnergyCertificate(certificate);
+                    certificate.getAddressList().add(validatedAddress);
+                }
+            }
+            return true;
+        } else if (propertyDetails != null && !propertyDetails.isEmpty()) {
+            boolean isVerified = propertyDetails.stream().anyMatch(addr ->
+                    ValidationStateEnum.VERIFIED.equals(addr.getRealEstateAddress().getValidationState()) ||
+                    ValidationStateEnum.CORRECTED.equals(addr.getRealEstateAddress().getValidationState()) ||
+                    ValidationStateEnum.NORMALIZED.equals(addr.getRealEstateAddress().getValidationState()));
+
+            boolean isNotVerified = propertyDetails.stream().anyMatch(addr ->
+                    ValidationStateEnum.NOT_UNIQUE.equals(addr.getRealEstateAddress().getValidationState()) ||
+                    ValidationStateEnum.NOT_FOUND.equals(addr.getRealEstateAddress().getValidationState()));
+
+            if (isVerified) {
+                updateValidationAddressAndProperties(certificate, response);
+                return false;
+            } else if (isNotVerified) {
+                linkPropertiesToCertificate(certificate, response);
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private void updateValidationAddressAndProperties(EpcEnergyCertificate certificate, ObjectDeterminationByAddressResponse response) {
+        List<EpcAddress> addresses = certificate.getAddressList();
+        if (addresses == null) {
+            addresses = new ArrayList<>();
+            certificate.setAddressList(addresses);
+        }
+        List<PostalAddress> postalAddresses = response.getSearchResult().getPostalAddress();
+        if (postalAddresses != null && !postalAddresses.isEmpty()) {
+            for (PostalAddress validated : postalAddresses) {
+                EpcAddress newAddress = mapper.toEpcAddressMapper(validated);
+                newAddress.setAddressSource(String.valueOf(AddressSourceEnum.PD_VALIDATED));
+                newAddress.setEnergyCertificate(certificate);
+                addresses.add(newAddress);
+            }
+        }
+        linkPropertiesToCertificate(certificate, response);
+    }
+
+    private void linkPropertiesToCertificate(EpcEnergyCertificate certificate, ObjectDeterminationByAddressResponse response) {
+        List<PropertyDetails> propertyDetailsList = response.getSearchResult().getPropertyDetails();
+        if (propertyDetailsList == null || propertyDetailsList.isEmpty()) return;
+
+        for (PropertyDetails pd : propertyDetailsList) {
+            if (pd.getPropertyId() == null) continue;
+
+            List<EpcProperty> existingProperties = epcPropertyRepository.findByPropertyId(pd.getPropertyId());
+            EpcProperty property;
+
+            if (existingProperties != null && !existingProperties.isEmpty()) {
+                property = existingProperties.get(0);
+            } else {
+                property = new EpcProperty();
+                property.setPropertyId(pd.getPropertyId());
+            }
+
+            if (!property.getEnergyCertificateList().contains(certificate)) {
+                property.getEnergyCertificateList().add(certificate);
+            }
+
+            if (!certificate.getPropertyIdList().contains(property)) {
+                certificate.getPropertyIdList().add(property);
+            }
+        }
+    }
+}
